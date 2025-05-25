@@ -640,6 +640,7 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
     def _convert_converse_tool_config(self, tools: Optional[list[PromptMessageTool]] = None) -> dict:
         tool_config = {}
         configs = []
+        logger.info(tools)
         if tools:
             for tool in tools:
                 configs.append(
