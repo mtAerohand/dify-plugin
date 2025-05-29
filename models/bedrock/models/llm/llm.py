@@ -2,6 +2,8 @@
 import base64
 import json
 import logging
+import time
+import random
 from collections.abc import Generator
 from typing import Optional, Union, cast
 
@@ -174,7 +176,21 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         # invoke other models via boto3 client
         return self._generate(model_id, credentials, prompt_messages, model_parameters, stop, stream, user)
 
-    def _generate_with_converse(
+    def _has_tool_blocks_in_messages(self, messages: list[dict]) -> bool:
+        """Check if any message contains toolUse or toolResult blocks"""
+        tool_block_found = False
+        for message in messages:
+            content = message.get('content', [])
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and ('toolUse' in item or 'toolResult' in item):
+                        logger.debug(f"Found tool block in message: {list(item.keys())}")
+                        tool_block_found = True
+        
+        logger.info(f"Tool blocks in messages: {tool_block_found}")
+        return tool_block_found
+    
+    def _generate_with_converse_internal(
         self,
         model_info: dict,
         credentials: dict,
@@ -186,15 +202,7 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         tools: Optional[list[PromptMessageTool]] = None,
     ) -> Union[LLMResult, Generator]:
         """
-        Invoke large language model with converse API
-
-        :param model_info: model information
-        :param credentials: model credentials
-        :param prompt_messages: prompt messages
-        :param model_parameters: model parameters
-        :param stop: stop words
-        :param stream: is stream response
-        :return: full response or stream response chunk generator result
+        Invoke large language model with converse API (internal implementation)
         """
         bedrock_client = get_bedrock_client("bedrock-runtime", credentials)
 
@@ -202,11 +210,9 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         enable_cache = model_parameters.pop("enable_cache", False)
         logger.info(f"---enable_cache---: {enable_cache}")
         model_id = model_info["model"]
-        print(f"[CACHE DEBUG] Model: {model_id}, Cache enabled: {enable_cache}")
         logger.info(f"[CACHE DEBUG] Model: {model_id}, Cache enabled: {enable_cache}")
 
         cache_supported = is_cache_supported(model_id) and enable_cache
-        print(f"[CACHE DEBUG] Model: {model_id}, Cache supported: {cache_supported}")
         logger.info(f"[CACHE DEBUG] Model: {model_id}, Cache supported: {cache_supported}")
 
         # Convert messages with cache points if enabled
@@ -227,8 +233,31 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         if model_info["support_system_prompts"] and system and len(system) > 0:
             parameters["system"] = system
 
-        if model_info["support_tool_use"] and tools:
-            parameters["toolConfig"] = self._convert_converse_tool_config(tools=tools)
+        # 重要: toolConfig設定の修正版
+        if model_info["support_tool_use"]:
+            has_tool_blocks = self._has_tool_blocks_in_messages(prompt_message_dicts)
+            has_current_tools = tools and len(tools) > 0
+            
+            logger.info(f"Tool analysis - Current tools: {has_current_tools}, Tool blocks in history: {has_tool_blocks}")
+            
+            # toolUse/toolResultブロックがある場合は必ずtoolConfigが必要
+            if has_tool_blocks or has_current_tools:
+                # 現在のツールがある場合はそれを使用、ない場合はダミーツールを作成
+                if has_current_tools:
+                    tool_config = self._convert_converse_tool_config(tools=tools)
+                else:
+                    # 履歴にtoolブロックがあるが現在ツールがない場合、ダミーツールを作成
+                    tool_config = self._create_dummy_tool_config()
+                
+                if tool_config and "tools" in tool_config and len(tool_config["tools"]) > 0:
+                    parameters["toolConfig"] = tool_config
+                    logger.info(f"toolConfig set for model {model_info['model']} - Current tools: {has_current_tools}, Tool blocks: {has_tool_blocks}")
+                else:
+                    logger.error(f"Failed to create valid toolConfig for model {model_info['model']}")
+                    raise InvokeError("Failed to create required toolConfig")
+            else:
+                logger.info(f"No toolConfig needed for model {model_info['model']} - no tools or tool blocks")
+
         try:
             # for issue #10976
             conversations_list = parameters["messages"]
@@ -236,6 +265,11 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
             for i in range(len(conversations_list) - 2, -1, -1):
                 if conversations_list[i]["role"] == conversations_list[i + 1]["role"]:
                     conversations_list[i]["content"].extend(conversations_list.pop(i + 1)["content"])
+
+            # デバッグ用: 最終的なパラメータをログ出力
+            logger.info(f"Final parameters for {model_info['model']}: toolConfig present = {'toolConfig' in parameters}")
+            if 'toolConfig' in parameters:
+                logger.info(f"toolConfig tools count: {len(parameters['toolConfig'].get('tools', []))}")
 
             if stream:
                 response = bedrock_client.converse_stream(**parameters)
@@ -257,40 +291,127 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
                     cache_write_tokens = response["usage"].get("cacheWriteInputTokens", 0)
 
                     # Always log the metrics for debugging
-                    print(f"[CACHE METRICS] Model: {model_id}, Read: {cache_read_tokens} tokens, Write: {cache_write_tokens} tokens")
                     logger.info(f"[CACHE METRICS] Model: {model_id}, Read: {cache_read_tokens} tokens, Write: {cache_write_tokens} tokens")
 
                     # Print the full response usage for debugging
-                    print(f"[CACHE DEBUG] Response usage: {json.dumps(response['usage'], default=str)}")
 
                     # Log cache usage if any tokens were read or written
                     if cache_read_tokens > 0 or cache_write_tokens > 0:
                         logger.info(f"Cache metrics - Model: {model_id}, Read: {cache_read_tokens} tokens, Write: {cache_write_tokens} tokens")
                         # If tokens were read from cache, log the savings
                         if cache_read_tokens > 0:
-                            print(f"[CACHE HIT] {cache_read_tokens} tokens read from cache")
                             logger.info(f"Cache hit detected - {cache_read_tokens} tokens read from cache")
                         elif cache_write_tokens > 0:
-                            print(f"[CACHE WRITE] {cache_write_tokens} tokens written to cache")
                             logger.info(f"Cache write detected - {cache_write_tokens} tokens written to cache")
                 else:
                     # Log if usage data is missing
-                    print(f"[WARNING] No usage data in response")
                     logger.warning(f"No usage data in response")
 
                 return self._handle_converse_response(model_info["model"], credentials, response, prompt_messages)
+                
         except ClientError as ex:
-            error_code = ex.response["Error"]["Code"]
-            full_error_msg = f"{error_code}: {ex.response['Error']['Message']}"
-            raise self._map_client_to_invoke_error(error_code, full_error_msg)
+            # ClientErrorはここでキャッチせず、上位のリトライロジックで処理
+            raise ex
         except (EndpointConnectionError, NoRegionError, ServiceNotInRegionError) as ex:
             raise InvokeConnectionError(str(ex))
-
         except UnknownServiceError as ex:
             raise InvokeServerUnavailableError(str(ex))
-
         except Exception as ex:
             raise InvokeError(str(ex))
+        
+    def _generate_with_converse(
+        self,
+        model_info: dict,
+        credentials: dict,
+        prompt_messages: list[PromptMessage],
+        model_parameters: dict,
+        stop: Optional[list[str]] = None,
+        stream: bool = True,
+        user: Optional[str] = None,
+        tools: Optional[list[PromptMessageTool]] = None,
+    ) -> Union[LLMResult, Generator]:
+        """
+        Invoke large language model with converse API (with retry logic)
+        """
+        return self._generate_with_converse_with_retry(
+            model_info, credentials, prompt_messages, model_parameters,
+            stop, stream, user, tools
+        )
+    
+    def _create_dummy_tool_config(self) -> dict:
+        """
+        Create a dummy tool config when tool blocks exist in history but no current tools
+        This is required by AWS Bedrock when toolUse/toolResult blocks are present
+        """
+        logger.info("Creating dummy tool config for tool block compatibility")
+        return {
+            "tools": [
+                {
+                    "toolSpec": {
+                        "name": "dummy_tool",
+                        "description": "A placeholder tool to satisfy AWS Bedrock toolConfig requirements when tool blocks exist in conversation history",
+                        "inputSchema": {
+                            "json": {
+                                "type": "object",
+                                "properties": {
+                                    "query": {
+                                        "type": "string",
+                                        "description": "Dummy parameter"
+                                    }
+                                },
+                                "required": ["query"]
+                            }
+                        }
+                    }
+                }
+            ]
+        }
+    
+    def _generate_with_converse_with_retry(
+        self,
+        model_info: dict,
+        credentials: dict,
+        prompt_messages: list[PromptMessage],
+        model_parameters: dict,
+        stop: Optional[list[str]] = None,
+        stream: bool = True,
+        user: Optional[str] = None,
+        tools: Optional[list[PromptMessageTool]] = None,
+    ) -> Union[LLMResult, Generator]:
+        """
+        Converse API with retry logic for throttling
+        """
+        max_retries = 3
+        base_delay = 2  # 2秒
+        
+        for attempt in range(max_retries):
+            try:
+                return self._generate_with_converse_internal(
+                    model_info, credentials, prompt_messages, model_parameters, 
+                    stop, stream, user, tools
+                )
+            except ClientError as ex:
+                error_code = ex.response["Error"]["Code"]
+                full_error_msg = f"{error_code}: {ex.response['Error']['Message']}"
+                
+                if error_code in {"ThrottlingException", "ServiceQuotaExceededException"}:
+                    if attempt < max_retries - 1:  # 最後の試行でない場合
+                        # 指数バックオフ + ジッター
+                        delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                        logger.warning(f"Rate limit hit for model {model_info['model']}, retrying in {delay:.2f} seconds (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        logger.error(f"Max retries exceeded for rate limiting on model {model_info['model']}")
+                
+                # 他のエラーまたは最大試行回数に達した場合は再発生
+                raise self._map_client_to_invoke_error(error_code, full_error_msg)
+            except Exception as ex:
+                # 他の例外は直接再発生
+                raise
+        
+        # この行には到達しないはずですが、安全のため
+        raise InvokeError("Unexpected error in retry logic")
 
     def _handle_converse_response(
         self, model: str, credentials: dict, response: dict, prompt_messages: list[PromptMessage]
@@ -415,25 +536,17 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
                         cache_write_tokens = chunk["metadata"]["usage"].get("cacheWriteInputTokens", 0)
 
                         # Always log the metrics for debugging
-                        print(f"[STREAM CACHE METRICS] Model: {model}, Read: {cache_read_tokens} tokens, Write: {cache_write_tokens} tokens")
                         logger.info(f"[STREAM CACHE METRICS] Model: {model}, Read: {cache_read_tokens} tokens, Write: {cache_write_tokens} tokens")
-
-                        # Print the full usage data for debugging
-                        print(f"[STREAM USAGE DATA] {json.dumps(chunk['metadata']['usage'], default=str)}")
 
                         # Log cache usage if any tokens were read or written
                         if cache_read_tokens > 0 or cache_write_tokens > 0:
                             logger.info(f"Cache metrics - Model: {model}, Read: {cache_read_tokens} tokens, Write: {cache_write_tokens} tokens")
                             # If tokens were read from cache, log the savings
                             if cache_read_tokens > 0:
-                                print(f"[STREAM CACHE HIT] {cache_read_tokens} tokens read from cache")
                                 logger.info(f"Cache hit detected - {cache_read_tokens} tokens read from cache")
                             elif cache_write_tokens > 0:
-                                print(f"[STREAM CACHE WRITE] {cache_write_tokens} tokens written to cache")
                                 logger.info(f"Cache write detected - {cache_write_tokens} tokens written to cache")
                     else:
-                        # Log if usage data is missing
-                        print(f"[STREAM WARNING] No usage data in metadata: {json.dumps(chunk['metadata'], default=str)}")
                         logger.warning(f"No usage data in metadata chunk: {json.dumps(chunk['metadata'], default=str)}")
 
                     usage = self._calc_response_usage(model, credentials, input_tokens, output_tokens)
@@ -602,7 +715,6 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
         # Add cache point to system if it's not empty and caching is supported for system field
         if system and cache_supported and cache_config and "system" in cache_config["supported_fields"]:
             system.append({"cachePoint": {"type": "default"}})
-            print(f"[CACHE DEBUG] Added cache point to system messages for model: {model_id}")
 
         # Process other messages
         for message in other_messages:
@@ -624,36 +736,44 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
                 if isinstance(message["content"], list):
                     # Add cache point to the content array
                     message["content"].append({"cachePoint": {"type": "default"}})
-                    print(f"[CACHE DEBUG] Added cache point to second-to-last user message content list for model: {model_id}")
                 else:
                     # If content is not a list, convert it to a list with the original content and add cache point
                     original_content = message["content"]
                     message["content"] = [{"text": original_content}, {"cachePoint": {"type": "default"}}]
-                    print(f"[CACHE DEBUG] Converted second-to-last user message content to list and added cache point for model: {model_id}")
-
-        # Print the final system and messages for debugging
-        print(f"[CACHE DEBUG] System messages: {json.dumps(system, default=str)}")
-        print(f"[CACHE DEBUG] Prompt messages: {json.dumps(prompt_message_dicts, default=str)}")
 
         return system, prompt_message_dicts
 
     def _convert_converse_tool_config(self, tools: Optional[list[PromptMessageTool]] = None) -> dict:
-        tool_config = {}
+        """Convert tools to toolConfig format - only when tools exist"""
+        if not tools or len(tools) == 0:
+            logger.warning("_convert_converse_tool_config called with no tools")
+            return {}  # ツールがない場合は空辞書を返す
+        
         configs = []
-        logger.info(tools)
-        if tools:
-            for tool in tools:
-                configs.append(
-                    {
-                        "toolSpec": {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "inputSchema": {"json": tool.parameters},
-                        }
-                    }
-                )
-            tool_config["tools"] = configs
-            return tool_config
+        logger.info(f"Converting {len(tools)} tools to toolConfig")
+        
+        for tool in tools:
+            if not tool.name or not tool.description:
+                logger.warning(f"Skipping invalid tool: name={tool.name}, description={tool.description}")
+                continue
+                
+            config = {
+                "toolSpec": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "inputSchema": {"json": tool.parameters or {}},
+                }
+            }
+            configs.append(config)
+            logger.debug(f"Added tool config: {tool.name}")
+        
+        if not configs:
+            logger.warning("No valid tools found after processing")
+            return {}
+        
+        tool_config = {"tools": configs}
+        logger.info(f"Successfully created toolConfig with {len(configs)} tools")
+        return tool_config
 
     def _convert_prompt_message_to_dict(self, message: PromptMessage) -> dict:
         """
@@ -1116,12 +1236,11 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
     def _map_client_to_invoke_error(self, error_code: str, error_msg: str) -> type[InvokeError]:
         """
         Map client error to invoke error
-
-        :param error_code: error code
-        :param error_msg: error message
-        :return: invoke error
         """
-
+        # スロットリングエラーの詳細ログ
+        if error_code in {"ThrottlingException", "ServiceQuotaExceededException"}:
+            logger.warning(f"Rate limit exceeded: {error_msg}")
+        
         if error_code == "AccessDeniedException":
             return InvokeAuthorizationError(error_msg)
         elif error_code in {"ResourceNotFoundException", "ValidationException"}:
@@ -1130,7 +1249,7 @@ class BedrockLargeLanguageModel(LargeLanguageModel):
             return InvokeRateLimitError(error_msg)
         elif error_code in {
             "ModelTimeoutException",
-            "ModelErrorException",
+            "ModelErrorException", 
             "InternalServerException",
             "ModelNotReadyException",
         }:
